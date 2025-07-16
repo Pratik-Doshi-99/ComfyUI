@@ -382,6 +382,24 @@ class HunyuanVideo(LatentFormat):
     ]
 
     latent_rgb_factors_bias = [ 0.0259, -0.0192, -0.0761]
+    taesd_decoder_name = "taehv_decoder"
+    
+    def process_in(self, latent):
+        # Handle variable channel counts - some HunyuanVideo models produce 19 channels, others 16
+        if latent.shape[1] == 19:
+            # Take first 16 channels for models that produce 19 channels
+            latent = latent[:, :16]
+        elif latent.shape[1] != 16:
+            # Log unexpected channel counts for debugging
+            import logging
+            logging.warning(f"HunyuanVideo: Unexpected channel count {latent.shape[1]}, expected 16 or 19")
+        
+        # Apply scale factor
+        return latent * self.scale_factor
+    
+    def process_out(self, latent):
+        # Reverse the scaling applied in process_in
+        return latent / self.scale_factor
 
 class Cosmos1CV8x8x8(LatentFormat):
     latent_channels = 16
@@ -445,7 +463,7 @@ class Wan21(LatentFormat):
         ]).view(1, self.latent_channels, 1, 1, 1)
 
 
-        self.taesd_decoder_name = None #TODO
+        self.taesd_decoder_name = "taew21_decoder"
 
     def process_in(self, latent):
         latents_mean = self.latents_mean.to(latent.device, latent.dtype)

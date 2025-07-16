@@ -2,6 +2,7 @@ import torch
 from PIL import Image
 from comfy.cli_args import args, LatentPreviewMethod
 from comfy.taesd.taesd import TAESD
+from comfy.taehv.taehv import TAEHV
 import comfy.model_management
 import folder_paths
 import comfy.utils
@@ -33,6 +34,27 @@ class TAESDPreviewerImpl(LatentPreviewer):
 
     def decode_latent_to_preview(self, x0):
         x_sample = self.taesd.decode(x0[:1])[0].movedim(0, 2)
+        return preview_to_image(x_sample)
+
+class TAEHVPreviewerImpl(LatentPreviewer):
+    def __init__(self, taehv):
+        self.taehv = taehv
+
+    def decode_latent_to_preview(self, x0):
+        # For video models, we take the first frame for preview
+        if x0.ndim == 5:
+            # Already NTCHW format
+            decoded = self.taehv.decode(x0[:1, :1])
+            if decoded.ndim == 4:
+                # NCHW output
+                x_sample = decoded[0].movedim(0, 2)
+            else:
+                # NTCHW output, take first frame
+                x_sample = decoded[0, 0].movedim(0, 2)
+        else:
+            # NCHW format, add temporal dimension
+            decoded = self.taehv.decode(x0[:1])
+            x_sample = decoded[0].movedim(0, 2)
         return preview_to_image(x_sample)
 
 
@@ -78,8 +100,13 @@ def get_previewer(device, latent_format):
 
         if method == LatentPreviewMethod.TAESD:
             if taesd_decoder_path:
-                taesd = TAESD(None, taesd_decoder_path, latent_channels=latent_format.latent_channels).to(device)
-                previewer = TAESDPreviewerImpl(taesd)
+                # Check if this is a video model (TAEHV)
+                if latent_format.taesd_decoder_name in ["taehv_decoder", "taew21_decoder"]:
+                    taehv = TAEHV(checkpoint_path=taesd_decoder_path).to(device)
+                    previewer = TAEHVPreviewerImpl(taehv)
+                else:
+                    taesd = TAESD(None, taesd_decoder_path, latent_channels=latent_format.latent_channels).to(device)
+                    previewer = TAESDPreviewerImpl(taesd)
             else:
                 logging.warning("Warning: TAESD previews enabled, but could not find models/vae_approx/{}".format(latent_format.taesd_decoder_name))
 

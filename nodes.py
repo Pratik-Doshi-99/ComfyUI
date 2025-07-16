@@ -699,6 +699,8 @@ class VAELoader:
         sd3_taesd_dec = False
         f1_taesd_enc = False
         f1_taesd_dec = False
+        taehv_available = False
+        taew21_available = False
 
         for v in approx_vaes:
             if v.startswith("taesd_decoder."):
@@ -717,6 +719,10 @@ class VAELoader:
                 f1_taesd_dec = True
             elif v.startswith("taef1_decoder."):
                 f1_taesd_enc = True
+            elif v.startswith("taehv."):
+                taehv_available = True
+            elif v.startswith("taew21."):
+                taew21_available = True
         if sd1_taesd_dec and sd1_taesd_enc:
             vaes.append("taesd")
         if sdxl_taesd_dec and sdxl_taesd_enc:
@@ -725,6 +731,10 @@ class VAELoader:
             vaes.append("taesd3")
         if f1_taesd_dec and f1_taesd_enc:
             vaes.append("taef1")
+        if taehv_available:
+            vaes.append("taehv")
+        if taew21_available:
+            vaes.append("taew21")
         return vaes
 
     @staticmethod
@@ -732,29 +742,54 @@ class VAELoader:
         sd = {}
         approx_vaes = folder_paths.get_filename_list("vae_approx")
 
-        encoder = next(filter(lambda a: a.startswith("{}_encoder.".format(name)), approx_vaes))
-        decoder = next(filter(lambda a: a.startswith("{}_decoder.".format(name)), approx_vaes))
+        # Handle video models (TAEHV) differently - single model file
+        if name in ["taehv", "taew21"]:
+            model_file = next(filter(lambda a: a.startswith("{}.".format(name)), approx_vaes))
+            model_weights = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", model_file))
+            
+            # TAEHV has both encoder and decoder in single file
+            # We need to add the weights with appropriate prefixes for VAE detection
+            for k in model_weights:
+                if k.startswith("decoder."):
+                    sd["taehv_decoder.{}".format(k)] = model_weights[k]
+                elif k.startswith("encoder."):
+                    sd["taehv_encoder.{}".format(k)] = model_weights[k]
+                else:
+                    # For weights without clear prefix, assume they're decoder weights
+                    sd["taehv_decoder.{}".format(k)] = model_weights[k]
+            
+            # Set appropriate scale/shift for video models
+            if name == "taehv":
+                sd["vae_scale"] = torch.tensor(0.476986)  # HunyuanVideo scale
+                sd["vae_shift"] = torch.tensor(0.0)
+            elif name == "taew21":
+                sd["vae_scale"] = torch.tensor(1.0)  # Wan21 scale
+                sd["vae_shift"] = torch.tensor(0.0)
+        else:
+            # Handle regular TAESD models
+            encoder = next(filter(lambda a: a.startswith("{}_encoder.".format(name)), approx_vaes))
+            decoder = next(filter(lambda a: a.startswith("{}_decoder.".format(name)), approx_vaes))
 
-        enc = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", encoder))
-        for k in enc:
-            sd["taesd_encoder.{}".format(k)] = enc[k]
+            enc = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", encoder))
+            for k in enc:
+                sd["taesd_encoder.{}".format(k)] = enc[k]
 
-        dec = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", decoder))
-        for k in dec:
-            sd["taesd_decoder.{}".format(k)] = dec[k]
+            dec = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", decoder))
+            for k in dec:
+                sd["taesd_decoder.{}".format(k)] = dec[k]
 
-        if name == "taesd":
-            sd["vae_scale"] = torch.tensor(0.18215)
-            sd["vae_shift"] = torch.tensor(0.0)
-        elif name == "taesdxl":
-            sd["vae_scale"] = torch.tensor(0.13025)
-            sd["vae_shift"] = torch.tensor(0.0)
-        elif name == "taesd3":
-            sd["vae_scale"] = torch.tensor(1.5305)
-            sd["vae_shift"] = torch.tensor(0.0609)
-        elif name == "taef1":
-            sd["vae_scale"] = torch.tensor(0.3611)
-            sd["vae_shift"] = torch.tensor(0.1159)
+            if name == "taesd":
+                sd["vae_scale"] = torch.tensor(0.18215)
+                sd["vae_shift"] = torch.tensor(0.0)
+            elif name == "taesdxl":
+                sd["vae_scale"] = torch.tensor(0.13025)
+                sd["vae_shift"] = torch.tensor(0.0)
+            elif name == "taesd3":
+                sd["vae_scale"] = torch.tensor(1.5305)
+                sd["vae_shift"] = torch.tensor(0.0609)
+            elif name == "taef1":
+                sd["vae_scale"] = torch.tensor(0.3611)
+                sd["vae_shift"] = torch.tensor(0.1159)
         return sd
 
     @classmethod
@@ -767,7 +802,7 @@ class VAELoader:
 
     #TODO: scale factor?
     def load_vae(self, vae_name):
-        if vae_name in ["taesd", "taesdxl", "taesd3", "taef1"]:
+        if vae_name in ["taesd", "taesdxl", "taesd3", "taef1", "taehv", "taew21"]:
             sd = self.load_taesd(vae_name)
         else:
             vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)

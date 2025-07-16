@@ -52,6 +52,8 @@ import comfy.lora_convert
 import comfy.hooks
 import comfy.t2i_adapter.adapter
 import comfy.taesd.taesd
+import comfy.taehv.taehv
+import comfy.latent_formats
 
 import comfy.ldm.flux.redux
 
@@ -297,6 +299,28 @@ class VAE:
             elif "taesd_decoder.1.weight" in sd:
                 self.latent_channels = sd["taesd_decoder.1.weight"].shape[1]
                 self.first_stage_model = comfy.taesd.taesd.TAESD(latent_channels=self.latent_channels)
+            elif any(key.startswith("taehv_decoder.") for key in sd.keys()):
+                self.latent_channels = 16
+                self.latent_dim = 3
+                self.first_stage_model = comfy.taehv.taehv.TAEHV.from_comfy_state_dict(sd)
+                self.memory_used_decode = lambda shape, dtype: (1000 * shape[2] * shape[3] * shape[4] * 64) * model_management.dtype_size(dtype)
+                self.memory_used_encode = lambda shape, dtype: (1000 * shape[2] * shape[3] * shape[4]) * model_management.dtype_size(dtype)
+                # Set up latent format for channel processing
+                self.latent_format = comfy.latent_formats.HunyuanVideo()
+                # Set device and dtype before returning
+                if device is None:
+                    device = model_management.vae_device()
+                self.device = device
+                offload_device = model_management.vae_offload_device()
+                if dtype is None:
+                    dtype = model_management.vae_dtype(self.device, self.working_dtypes)
+                self.vae_dtype = dtype
+                self.first_stage_model.to(self.vae_dtype)
+                self.output_device = model_management.intermediate_device()
+                self.patcher = comfy.model_patcher.ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device)
+                # Skip normal state dict loading since TAEHV handles it internally
+                self.first_stage_model = self.first_stage_model.eval()
+                return
             elif "vquantizer.codebook.weight" in sd: #VQGan: stage a of stable cascade
                 self.first_stage_model = StageA()
                 self.downscale_ratio = 4
@@ -504,7 +528,12 @@ class VAE:
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x * 2, tile_y // 2, overlap)
         pbar = comfy.utils.ProgressBar(steps)
 
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+        def decode_fn(a):
+            a = a.to(self.vae_dtype).to(self.device)
+            # Apply latent format processing if available (for channel conversion, etc.)
+            if hasattr(self, 'latent_format') and hasattr(self.latent_format, 'process_in'):
+                a = self.latent_format.process_in(a)
+            return self.first_stage_model.decode(a).float()
         output = self.process_output(
             (comfy.utils.tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar) +
             comfy.utils.tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device, pbar = pbar) +
@@ -514,16 +543,31 @@ class VAE:
 
     def decode_tiled_1d(self, samples, tile_x=128, overlap=32):
         if samples.ndim == 3:
-            decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+            def decode_fn(a):
+                a = a.to(self.vae_dtype).to(self.device)
+                # Apply latent format processing if available (for channel conversion, etc.)
+                if hasattr(self, 'latent_format') and hasattr(self.latent_format, 'process_in'):
+                    a = self.latent_format.process_in(a)
+                return self.first_stage_model.decode(a).float()
         else:
             og_shape = samples.shape
             samples = samples.reshape((og_shape[0], og_shape[1] * og_shape[2], -1))
-            decode_fn = lambda a: self.first_stage_model.decode(a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device)).float()
+            def decode_fn(a):
+                a = a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device)
+                # Apply latent format processing if available (for channel conversion, etc.)
+                if hasattr(self, 'latent_format') and hasattr(self.latent_format, 'process_in'):
+                    a = self.latent_format.process_in(a)
+                return self.first_stage_model.decode(a).float()
 
         return self.process_output(comfy.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device))
 
     def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+        def decode_fn(a):
+            a = a.to(self.vae_dtype).to(self.device)
+            # Apply latent format processing if available (for channel conversion, etc.)
+            if hasattr(self, 'latent_format') and hasattr(self.latent_format, 'process_in'):
+                a = self.latent_format.process_in(a)
+            return self.first_stage_model.decode(a).float()
         return self.process_output(comfy.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
 
     def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
@@ -574,6 +618,9 @@ class VAE:
 
             for x in range(0, samples_in.shape[0], batch_number):
                 samples = samples_in[x:x+batch_number].to(self.vae_dtype).to(self.device)
+                # Apply latent format processing if available (for channel conversion, etc.)
+                if hasattr(self, 'latent_format') and hasattr(self.latent_format, 'process_in'):
+                    samples = self.latent_format.process_in(samples)
                 out = self.process_output(self.first_stage_model.decode(samples, **vae_options).to(self.output_device).float())
                 if pixel_samples is None:
                     pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
