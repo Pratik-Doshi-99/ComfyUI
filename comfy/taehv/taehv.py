@@ -8,25 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import namedtuple
 
-# Simple tqdm replacement for ComfyUI environment
-class tqdm:
-    def __init__(self, iterable=None, disable=False):
-        self.iterable = iterable
-        self.disable = disable
-        
-    def __iter__(self):
-        if self.iterable is not None:
-            return iter(self.iterable)
-        return self
-        
-    def __next__(self):
-        raise StopIteration
-        
-    def update(self, n=1):
-        pass
-        
-    def close(self):
-        pass
 
 import comfy.utils
 import comfy.ops
@@ -86,7 +67,7 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar):
     if parallel:
         x = x.reshape(N*T, C, H, W)
         # parallel over input timesteps, iterate over blocks
-        for b in tqdm(model, disable=not show_progress_bar):
+        for b in model:
             if isinstance(b, MemBlock):
                 NT, C, H, W = x.shape
                 T = NT // N
@@ -106,16 +87,10 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar):
         # because of the cursed TPool/TGrow blocks, this is not a nested loop,
         # it's actually a ***graph traversal*** problem! so let's make a queue
         work_queue = [TWorkItem(xt, 0) for t, xt in enumerate(x.reshape(N, T * C, H, W).chunk(T, dim=1))]
-        # in addition to manually managing our queue, we also need to manually manage our progressbar.
-        # we'll update it for every source node that we consume.
-        progress_bar = tqdm(range(T), disable=not show_progress_bar)
         # we'll also need a separate addressable memory per node as well
         mem = [None] * len(model)
         while work_queue:
             xt, i = work_queue.pop(0)
-            if i == 0:
-                # new source node consumed
-                progress_bar.update(1)
             if i == len(model):
                 # reached end of the graph, append result to output list
                 out.append(xt)
@@ -163,7 +138,6 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar):
                     xt = b(xt)
                     # add successor to work queue
                     work_queue.insert(0, TWorkItem(xt, i+1))
-        progress_bar.close()
         x = torch.stack(out, 1)
     return x
 
